@@ -1,5 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { GameCard, getRandomCards } from '@/data/cards';
+import { supabase } from '@/integrations/supabase/client';
+import { useAuth } from '@/contexts/AuthContext';
 
 export interface GameState {
   collection: GameCard[];
@@ -11,7 +13,7 @@ export interface GameState {
 
 const STORAGE_KEY = 'yas-card-game';
 
-function loadState(): GameState {
+function loadLocalState(): GameState {
   try {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved) return JSON.parse(saved);
@@ -19,33 +21,75 @@ function loadState(): GameState {
   return { collection: [], coins: 500, wins: 0, losses: 0, packsOpened: 0 };
 }
 
-function saveState(state: GameState) {
+function saveLocalState(state: GameState) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
 }
 
 export function useGameState() {
-  const [state, setState] = useState<GameState>(loadState);
+  const { user } = useAuth();
+  const [state, setState] = useState<GameState>(loadLocalState);
+
+  // 1. Fetch from Supabase when the user logs in
+  useEffect(() => {
+    if (!user) return;
+    const fetchState = async () => {
+      const { data, error } = await supabase
+        .from('profiles' as any)
+        .select('collection, wins, losses, packs_opened, coins')
+        .eq('id', user.id)
+        .single();
+
+      if (data && !error) {
+        setState(prev => {
+          const newState = {
+            ...prev,
+            coins: data.coins ?? prev.coins,
+            // Assert the JSONB from Supabase as GameCard array
+            collection: data.collection ? (data.collection as unknown as GameCard[]) : prev.collection,
+            wins: data.wins ?? prev.wins,
+            losses: data.losses ?? prev.losses,
+            packsOpened: data.packs_opened ?? prev.packsOpened,
+          };
+          saveLocalState(newState);
+          return newState;
+        });
+      }
+    };
+    fetchState();
+  }, [user]);
 
   const update = useCallback((updater: (prev: GameState) => GameState) => {
     setState(prev => {
       const next = updater(prev);
-      saveState(next);
+      saveLocalState(next); // Keep local storage fast and snappy
+      
+      // 2. Sync to Supabase securely in the background
+      if (user) {
+        supabase.from('profiles' as any).update({
+          collection: next.collection,
+          wins: next.wins,
+          losses: next.losses,
+          packs_opened: next.packsOpened
+          // We intentionally leave out 'coins' here because the Stripe Webhook 
+          // and the deduct_coins RPC handle the money securely on the server!
+        }).eq('id', user.id).then();
+      }
+      
       return next;
     });
-  }, []);
+  }, [user]);
 
   const openPack = useCallback(() => {
-    const cost = 100;
-    if (state.coins < cost) return [];
     const newCards = getRandomCards(5);
+    
     update(prev => ({
       ...prev,
-      coins: prev.coins - cost,
       collection: [...prev.collection, ...newCards],
       packsOpened: prev.packsOpened + 1,
     }));
+    
     return newCards;
-  }, [state.coins, update]);
+  }, [update]);
 
   const addWin = useCallback((reward: number) => {
     update(prev => ({ ...prev, wins: prev.wins + 1, coins: prev.coins + reward }));
